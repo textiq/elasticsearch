@@ -242,18 +242,53 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         if (closed) {
             throw new IllegalStateException("transport client is closed");
         }
-        ensureNodesAreAvailable(nodes);
+
+
+        doRetryWithExponentialBackoff(
+              () -> {
+                  ensureNodesAreAvailable(nodes);
+              },
+              (e) -> {
+                  throw e;
+              });
+
         int index = getNodeNumber();
         RetryListener<Response> retryListener = new RetryListener<>(callback, listener, nodes, index, hostFailureListener);
         DiscoveryNode node = retryListener.getNode(0);
-        try {
-            callback.doWithNode(node, retryListener);
-        } catch (Exception e) {
+
+        doRetryWithExponentialBackoff(
+              () -> {
+                  callback.doWithNode(node, retryListener);
+              },
+              (e) -> {
+                  try {
+                      //this exception can't come from the TransportService as it doesn't throw exception at all
+                      listener.onFailure(e);
+                  } finally {
+                      retryListener.maybeNodeFailed(node, e);
+                  }
+              });
+    }
+
+    public void doRetryWithExponentialBackoff(BasicCallback mainAttempt, ExceptionHandlingCallback onFailure) {
+        int failure = 0;
+        int maxFailure = 6;
+        while (true) {
             try {
-                //this exception can't come from the TransportService as it doesn't throw exception at all
-                listener.onFailure(e);
-            } finally {
-                retryListener.maybeNodeFailed(node, e);
+                mainAttempt.execute();
+                return;
+            } catch (RuntimeException mainException) {
+                try {
+                    failure += 1;
+                    if (failure <= maxFailure) {
+                        Thread.sleep(((int) Math.pow(2, failure)) * 1000);
+                    } else {
+                        onFailure.execute(mainException);
+                        return;
+                    }
+                } catch (InterruptedException interruptedException) {
+                    throw new RuntimeException(interruptedException);
+                }
             }
         }
     }
@@ -571,6 +606,14 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
     public interface NodeListenerCallback<Response> {
 
         void doWithNode(DiscoveryNode node, ActionListener<Response> listener);
+    }
+
+    public interface BasicCallback {
+        void execute();
+    }
+
+    public interface ExceptionHandlingCallback {
+        void execute(RuntimeException e);
     }
 
     // pkg private for testing
