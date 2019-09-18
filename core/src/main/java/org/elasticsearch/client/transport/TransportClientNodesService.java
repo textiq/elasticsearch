@@ -281,6 +281,8 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 try {
                     failure += 1;
                     if (failure <= maxFailure) {
+                        mainException.printStackTrace();
+                        System.err.println("Delayed due to above Exception");
                         Thread.sleep(((int) Math.pow(2, failure)) * 1000);
                     } else {
                         onFailure.execute(mainException);

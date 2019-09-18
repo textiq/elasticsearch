@@ -204,6 +204,8 @@ Elasticsearch uses "Gradle":https://gradle.org for its build system.
 
 In order to create a distribution, simply run the @./gradlew assemble@ command in the cloned directory.
 
+Note: you need gradle 4.6 for this. Do not use newer versions.
+
 The distribution for each project will be created under the @build/distributions@ directory in that project.
 
 See the "TESTING":TESTING.asciidoc file for more information about
