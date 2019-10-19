@@ -238,11 +238,25 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         // it is important that the order of first setting the state of
         // closed and then clearing the list of nodes is maintained in
         // the close method
-        final List<DiscoveryNode> nodes = this.nodes;
         if (closed) {
             throw new IllegalStateException("transport client is closed");
         }
 
+        ActionListener<Response> overwrittenActionListener = new ActionListener<Response>() {
+            @Override
+            public void onResponse(Response response) {
+                listener.onResponse(response);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                if (e instanceof RuntimeException) {
+                    throw (RuntimeException) e;
+                } else {
+                    listener.onFailure(e);
+                }
+            }
+        };
 
         doRetryWithExponentialBackoff(
               () -> {
@@ -252,21 +266,17 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                   throw e;
               });
 
-        int index = getNodeNumber();
-        RetryListener<Response> retryListener = new RetryListener<>(callback, listener, nodes, index, hostFailureListener);
-        DiscoveryNode node = retryListener.getNode(0);
 
         doRetryWithExponentialBackoff(
               () -> {
+                  int index = getNodeNumber();
+                  RetryListener<Response> retryListener = new RetryListener<>(callback, overwrittenActionListener,
+                                                                              nodes, index, hostFailureListener);
+                  DiscoveryNode node = retryListener.getNode(0);
                   callback.doWithNode(node, retryListener);
               },
               (e) -> {
-                  try {
-                      //this exception can't come from the TransportService as it doesn't throw exception at all
-                      listener.onFailure(e);
-                  } finally {
-                      retryListener.maybeNodeFailed(node, e);
-                  }
+                  listener.onFailure(e);
               });
     }
 
@@ -278,6 +288,10 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 mainAttempt.execute();
                 return;
             } catch (RuntimeException mainException) {
+                if (!((mainException instanceof NoNodeAvailableException)
+                      || (mainException instanceof NodeNotConnectedException))) {
+                    throw mainException;
+                }
                 try {
                     failure += 1;
                     if (failure <= maxFailure) {
