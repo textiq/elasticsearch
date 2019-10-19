@@ -290,7 +290,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             } catch (RuntimeException mainException) {
                 if (!((mainException instanceof NoNodeAvailableException)
                       || (mainException instanceof NodeNotConnectedException))) {
-                    throw mainException;
+                    onFailure.execute(mainException);
                 }
                 try {
                     failure += 1;
