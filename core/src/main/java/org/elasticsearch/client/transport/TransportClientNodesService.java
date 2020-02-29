@@ -27,6 +27,7 @@ import org.apache.lucene.util.IOUtils;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.NoShardAvailableActionException;
 import org.elasticsearch.action.admin.cluster.node.liveness.LivenessRequest;
 import org.elasticsearch.action.admin.cluster.node.liveness.LivenessResponse;
 import org.elasticsearch.action.admin.cluster.node.liveness.TransportLivenessAction;
@@ -322,7 +323,8 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
 
     public boolean isTextIQRetryExceptionClass(Exception e) {
         return e instanceof NoNodeAvailableException
-               || e instanceof NodeNotConnectedException;
+               || e instanceof NodeNotConnectedException
+               || e instanceof NoShardAvailableActionException;
     }
 
     public static class RetryListener<Response> implements ActionListener<Response> {
