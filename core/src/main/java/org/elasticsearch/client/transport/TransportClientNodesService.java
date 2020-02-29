@@ -373,6 +373,9 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         }
 
         final DiscoveryNode getNode(int i) {
+            if (nodes.size() == 0) {
+                throw new NoNodeAvailableException("No Node in TransportClientNodeService");
+            }
             return nodes.get((index + i) % nodes.size());
         }
 
