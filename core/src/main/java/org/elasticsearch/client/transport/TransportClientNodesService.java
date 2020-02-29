@@ -20,6 +20,7 @@
 package org.elasticsearch.client.transport;
 
 import com.carrotsearch.hppc.cursors.ObjectCursor;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.logging.log4j.util.Supplier;
 import org.apache.lucene.util.IOUtils;
@@ -250,7 +251,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
 
             @Override
             public void onFailure(Exception e) {
-                if (e instanceof RuntimeException) {
+                if (isTextIQRetryExceptionClass(e)) {
                     throw (RuntimeException) e;
                 } else {
                     listener.onFailure(e);
@@ -267,16 +268,26 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
               });
 
 
+        AtomicReference<RetryListener<Response>> refRetryListener = new AtomicReference<>();
+        AtomicReference<DiscoveryNode> refNode = new AtomicReference<>();
+
         doRetryWithExponentialBackoff(
               () -> {
                   int index = getNodeNumber();
                   RetryListener<Response> retryListener = new RetryListener<>(callback, overwrittenActionListener,
                                                                               nodes, index, hostFailureListener);
                   DiscoveryNode node = retryListener.getNode(0);
+                  refRetryListener.set(retryListener);
+                  refNode.set(node);
+
                   callback.doWithNode(node, retryListener);
               },
               (e) -> {
                   listener.onFailure(e);
+
+                  if (refRetryListener.get() != null && refNode.get() != null) {
+                      refRetryListener.get().maybeNodeFailed(refNode.get(), e);
+                  }
               });
     }
 
@@ -288,8 +299,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 mainAttempt.execute();
                 return;
             } catch (RuntimeException mainException) {
-                if (!((mainException instanceof NoNodeAvailableException)
-                      || (mainException instanceof NodeNotConnectedException))) {
+                if (!isTextIQRetryExceptionClass(mainException)) {
                     onFailure.execute(mainException);
                     return;
                 }
@@ -308,6 +318,11 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 }
             }
         }
+    }
+
+    public boolean isTextIQRetryExceptionClass(Exception e) {
+        return e instanceof NoNodeAvailableException
+               || e instanceof NodeNotConnectedException;
     }
 
     public static class RetryListener<Response> implements ActionListener<Response> {
