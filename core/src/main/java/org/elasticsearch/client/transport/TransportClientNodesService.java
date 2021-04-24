@@ -244,21 +244,6 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             throw new IllegalStateException("transport client is closed");
         }
 
-        ActionListener<Response> overwrittenActionListener = new ActionListener<Response>() {
-            @Override
-            public void onResponse(Response response) {
-                listener.onResponse(response);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                if (isTextIQRetryExceptionClass(e)) {
-                    throw (RuntimeException) e;
-                } else {
-                    listener.onFailure(e);
-                }
-            }
-        };
 
         doRetryWithExponentialBackoff(
               () -> {
@@ -272,6 +257,28 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         AtomicReference<RetryListener<Response>> refRetryListener = new AtomicReference<>();
         AtomicReference<DiscoveryNode> refNode = new AtomicReference<>();
 
+        ActionListener<Response> overwrittenActionListener = new ActionListener<Response>() {
+            @Override
+            public void onResponse(Response response) {
+                listener.onResponse(response);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                if (isTextIQRetryExceptionClass(e)) {
+                    throw (RuntimeException) e;
+                } else {
+                    try {
+                        listener.onFailure(e);
+                    } finally {
+                        if (refRetryListener.get() != null && refNode.get() != null) {
+                            refRetryListener.get().maybeNodeFailed(refNode.get(), e);
+                        }
+                    }
+                }
+            }
+        };
+
         doRetryWithExponentialBackoff(
               () -> {
                   int index = getNodeNumber();
@@ -284,10 +291,12 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                   callback.doWithNode(node, retryListener);
               },
               (e) -> {
-                  listener.onFailure(e);
-
-                  if (refRetryListener.get() != null && refNode.get() != null) {
-                      refRetryListener.get().maybeNodeFailed(refNode.get(), e);
+                  try {
+                      listener.onFailure(e);
+                  } finally {
+                      if (refRetryListener.get() != null && refNode.get() != null) {
+                          refRetryListener.get().maybeNodeFailed(refNode.get(), e);
+                      }
                   }
               });
     }
@@ -323,6 +332,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
 
     public boolean isTextIQRetryExceptionClass(Exception e) {
         return e instanceof NoNodeAvailableException
+               || e instanceof NodeDisconnectedException
                || e instanceof NodeNotConnectedException
                || e instanceof NoShardAvailableActionException;
     }
