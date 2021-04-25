@@ -254,78 +254,49 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
               });
 
 
-        AtomicReference<RetryListener<Response>> refRetryListener = new AtomicReference<>();
-        AtomicReference<DiscoveryNode> refNode = new AtomicReference<>();
-
-        ActionListener<Response> overwrittenActionListener = new ActionListener<Response>() {
-            @Override
-            public void onResponse(Response response) {
-                listener.onResponse(response);
-            }
-
-            @Override
-            public void onFailure(Exception e) {
-                if (isTextIQRetryExceptionClass(e)) {
-                    throw (RuntimeException) e;
-                } else {
-                    try {
-                        listener.onFailure(e);
-                    } finally {
-                        if (refRetryListener.get() != null && refNode.get() != null) {
-                            refRetryListener.get().maybeNodeFailed(refNode.get(), e);
-                        }
-                    }
-                }
-            }
-        };
+        RetryWithExponentialBackoffListener<Response> retryWithExponentialBackoffListener
+              = new RetryWithExponentialBackoffListener<>(this, callback, listener);
 
         doRetryWithExponentialBackoff(
-              () -> {
-                  int index = getNodeNumber();
-                  RetryListener<Response> retryListener = new RetryListener<>(callback, overwrittenActionListener,
-                                                                              nodes, index, hostFailureListener);
-                  DiscoveryNode node = retryListener.getNode(0);
-                  refRetryListener.set(retryListener);
-                  refNode.set(node);
-
-                  callback.doWithNode(node, retryListener);
-              },
-              (e) -> {
-                  try {
-                      listener.onFailure(e);
-                  } finally {
-                      if (refRetryListener.get() != null && refNode.get() != null) {
-                          refRetryListener.get().maybeNodeFailed(refNode.get(), e);
-                      }
-                  }
-              });
+              retryWithExponentialBackoffListener::mainAttempt,
+              retryWithExponentialBackoffListener::reportFailure);
     }
 
-    public void doRetryWithExponentialBackoff(BasicCallback mainAttempt, ExceptionHandlingCallback onFailure) {
-        int failure = 0;
+    public void doRetryWithExponentialBackoff(BasicCallback mainAttempt,
+                                              ExceptionHandlingCallback reportFailure) {
+        doRetryWithExponentialBackoff(mainAttempt,
+                                      reportFailure,
+                                      0);
+
+    }
+
+    public void doRetryWithExponentialBackoff(BasicCallback mainAttempt,
+                                              ExceptionHandlingCallback reportFailure,
+                                              int alreadyFailedTime) {
         int maxFailure = 6;
-        while (true) {
+
+        if (alreadyFailedTime <= maxFailure) {
             try {
-                mainAttempt.execute();
+                Thread.sleep((int) Math.pow(2, alreadyFailedTime) * 1000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
+        try {
+            mainAttempt.execute();
+            return;
+        } catch (RuntimeException mainException) {
+            if (!isTextIQRetryExceptionClass(mainException)) {
+                reportFailure.execute(mainException);
                 return;
-            } catch (RuntimeException mainException) {
-                if (!isTextIQRetryExceptionClass(mainException)) {
-                    onFailure.execute(mainException);
-                    return;
-                }
-                try {
-                    failure += 1;
-                    if (failure <= maxFailure) {
-                        mainException.printStackTrace();
-                        System.err.println("Delayed due to above Exception");
-                        Thread.sleep(((int) Math.pow(2, failure)) * 1000);
-                    } else {
-                        onFailure.execute(mainException);
-                        return;
-                    }
-                } catch (InterruptedException interruptedException) {
-                    throw new RuntimeException(interruptedException);
-                }
+            } else {
+                mainException.printStackTrace();
+                System.err.println("Delayed due to above Exception");
+
+                doRetryWithExponentialBackoff(mainAttempt,
+                                              reportFailure,
+                                              alreadyFailedTime + 1);
             }
         }
     }
@@ -335,6 +306,70 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                || e instanceof NodeDisconnectedException
                || e instanceof NodeNotConnectedException
                || e instanceof NoShardAvailableActionException;
+    }
+
+    public static class RetryWithExponentialBackoffListener<Response> implements ActionListener<Response> {
+        private TransportClientNodesService service;
+        private NodeListenerCallback<Response> callback;
+        private ActionListener<Response> listener;
+
+        private AtomicReference<RetryListener<Response>> refRetryListener;
+        private AtomicReference<DiscoveryNode> refNode;
+        private int failureCount;
+
+        public RetryWithExponentialBackoffListener(TransportClientNodesService service,
+                                                   NodeListenerCallback<Response> callback,
+                                                   ActionListener<Response> listener) {
+            this.service = service;
+            this.callback = callback;
+            this.listener = listener;
+
+            this.failureCount = 0;
+            this.refNode = new AtomicReference<>();
+            this.refRetryListener = new AtomicReference<>();
+        }
+
+        public void mainAttempt() {
+            int index = service.getNodeNumber();
+            RetryListener<Response> retryListener = new RetryListener<>(callback,
+                                                                        this,
+                                                                        service.nodes,
+                                                                        index,
+                                                                        service.hostFailureListener);
+            DiscoveryNode node = retryListener.getNode(0);
+            refRetryListener.set(retryListener);
+            refNode.set(node);
+
+            callback.doWithNode(node, retryListener);
+        }
+
+        public void reportFailure(Exception e) {
+            try {
+                listener.onFailure(e);
+            } finally {
+                if (refRetryListener.get() != null && refNode.get() != null) {
+                    refRetryListener.get().maybeNodeFailed(refNode.get(), e);
+                }
+            }
+        }
+
+        @Override
+        public void onResponse(Response response) {
+            listener.onResponse(response);
+        }
+
+        @Override
+        public void onFailure(Exception e) {
+            if (service.isTextIQRetryExceptionClass(e)) {
+                failureCount += 1;
+
+                service.doRetryWithExponentialBackoff(this::mainAttempt,
+                                                      this::reportFailure,
+                                                      failureCount);
+            } else {
+                reportFailure(e);
+            }
+        }
     }
 
     public static class RetryListener<Response> implements ActionListener<Response> {
@@ -347,7 +382,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         private volatile int i;
 
         RetryListener(NodeListenerCallback<Response> callback, ActionListener<Response> listener,
-                             List<DiscoveryNode> nodes, int index, TransportClient.HostFailureListener hostFailureListener) {
+                      List<DiscoveryNode> nodes, int index, TransportClient.HostFailureListener hostFailureListener) {
             this.callback = callback;
             this.listener = listener;
             this.nodes = nodes;
