@@ -20,6 +20,7 @@
 package org.elasticsearch.client.transport;
 
 import com.carrotsearch.hppc.cursors.ObjectCursor;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.logging.log4j.util.Supplier;
 import org.apache.lucene.util.IOUtils;
@@ -89,7 +90,8 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
 
     private final Object mutex = new Object();
 
-    private volatile List<DiscoveryNode> nodes = Collections.emptyList();
+    private AtomicReference<List<DiscoveryNode>> nodes = new AtomicReference<>();
+    
     private volatile List<DiscoveryNode> filteredNodes = Collections.emptyList();
 
     private final AtomicInteger tempNodeIdGenerator = new AtomicInteger();
@@ -155,7 +157,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
     }
 
     public List<DiscoveryNode> connectedNodes() {
-        return this.nodes;
+        return this.nodes.get();
     }
 
     public List<DiscoveryNode> filteredNodes() {
@@ -216,7 +218,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             }
             listedNodes = Collections.unmodifiableList(listNodesBuilder);
             List<DiscoveryNode> nodesBuilder = new ArrayList<>();
-            for (DiscoveryNode otherNode : nodes) {
+            for (DiscoveryNode otherNode : nodes.get()) {
                 if (!otherNode.getAddress().equals(transportAddress)) {
                     nodesBuilder.add(otherNode);
                 } else {
@@ -224,7 +226,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                     transportService.disconnectFromNode(otherNode);
                 }
             }
-            nodes = Collections.unmodifiableList(nodesBuilder);
+            nodes.set(Collections.unmodifiableList(nodesBuilder));
             nodesSampler.sample();
         }
         return this;
@@ -239,7 +241,6 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         // it is important that the order of first setting the state of
         // closed and then clearing the list of nodes is maintained in
         // the close method
-        final List<DiscoveryNode> nodes = this.nodes;
         if (closed) {
             throw new IllegalStateException("transport client is closed");
         }
@@ -306,16 +307,16 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
     public static class RetryListener<Response> implements ActionListener<Response> {
         private final NodeListenerCallback<Response> callback;
         private final ActionListener<Response> listener;
-        private final List<DiscoveryNode> nodes;
+        private final AtomicReference<List<DiscoveryNode>> nodes;
         private final int index;
         private final TransportClient.HostFailureListener hostFailureListener;
 
         private volatile int i;
-        private AtomicInteger retries;
-        private static final int MAX_FAILURE_RETRIES = 6;
+        private final AtomicInteger retries;
+        private static final int MAX_FAILURE_RETRIES = 10;
 
         RetryListener(NodeListenerCallback<Response> callback, ActionListener<Response> listener,
-                             List<DiscoveryNode> nodes, int index, TransportClient.HostFailureListener hostFailureListener) {
+                             AtomicReference<List<DiscoveryNode>> nodes, int index, TransportClient.HostFailureListener hostFailureListener) {
             this.callback = callback;
             this.listener = listener;
             this.nodes = nodes;
@@ -340,7 +341,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                     System.err.println("Delayed due to above Exception");
                     Thread.sleep(((int) Math.pow(2, currentRetryNum)) * 1000);
                     try {
-                        callback.doWithNode(getNode(i), this);
+                        callback.doWithNode(getNode(this.i), this);
                     } catch (final Exception inner) {
                         onFailure(inner);
                     }
@@ -351,7 +352,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 if (throwable instanceof ConnectTransportException) {
                     maybeNodeFailed(getNode(this.i), (ConnectTransportException) throwable);
                     int i = ++this.i;
-                    if (i >= nodes.size()) {
+                    if (i >= nodes.get().size()) {
                         listener.onFailure(new NoNodeAvailableException("None of the configured nodes were available: " + nodes, e));
                     } else {
                         try {
@@ -369,10 +370,10 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         }
 
         final DiscoveryNode getNode(int i) {
-            if (nodes.size() == 0) {
+            if (nodes.get().size() == 0) {
                 throw new NoNodeAvailableException("No Node in TransportClientNodeService");
             }
-            return nodes.get((index + i) % nodes.size());
+            return nodes.get().get((index + i) % nodes.get().size());
         }
 
         final void maybeNodeFailed(DiscoveryNode node, Exception ex) {
@@ -390,13 +391,13 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             }
             closed = true;
             FutureUtils.cancel(nodesSamplerFuture);
-            for (DiscoveryNode node : nodes) {
+            for (DiscoveryNode node : nodes.get()) {
                 transportService.disconnectFromNode(node);
             }
             for (DiscoveryNode listedNode : listedNodes) {
                 transportService.disconnectFromNode(listedNode);
             }
-            nodes = Collections.emptyList();
+            nodes.set(Collections.emptyList());
         }
     }
 
@@ -409,8 +410,8 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         return index;
     }
 
-    private void ensureNodesAreAvailable(List<DiscoveryNode> nodes) {
-        if (nodes.isEmpty()) {
+    private void ensureNodesAreAvailable(AtomicReference<List<DiscoveryNode>> nodes) {
+        if (nodes.get().isEmpty()) {
             String message = String.format(Locale.ROOT, "None of the configured nodes are available: %s", this.listedNodes);
             throw new NoNodeAvailableException(message);
         }
@@ -506,7 +507,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 }
             }
 
-            nodes = validateNewNodes(newNodes);
+            nodes.set(validateNewNodes(newNodes));
             filteredNodes = Collections.unmodifiableList(new ArrayList<>(newFilteredNodes));
         }
     }
@@ -521,7 +522,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             for (DiscoveryNode node : listedNodes) {
                 nodesToPing.add(node);
             }
-            for (DiscoveryNode node : nodes) {
+            for (DiscoveryNode node : nodes.get()) {
                 nodesToPing.add(node);
             }
 
@@ -562,7 +563,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                         @Override
                         protected void doRun() throws Exception {
                             Transport.Connection pingConnection = null;
-                            if (nodes.contains(nodeToPing)) {
+                            if (nodes.get().contains(nodeToPing)) {
                                 try {
                                     pingConnection = transportService.getConnection(nodeToPing);
                                 } catch (NodeNotConnectedException e) {
@@ -631,7 +632,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
                 }
             }
 
-            nodes = validateNewNodes(newNodes);
+            nodes.set(validateNewNodes(newNodes));
             filteredNodes = Collections.unmodifiableList(new ArrayList<>(newFilteredNodes));
         }
     }
