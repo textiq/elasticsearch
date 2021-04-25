@@ -26,6 +26,7 @@ import org.apache.lucene.util.IOUtils;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.NoShardAvailableActionException;
 import org.elasticsearch.action.admin.cluster.node.liveness.LivenessRequest;
 import org.elasticsearch.action.admin.cluster.node.liveness.LivenessResponse;
 import org.elasticsearch.action.admin.cluster.node.liveness.TransportLivenessAction;
@@ -242,7 +243,14 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         if (closed) {
             throw new IllegalStateException("transport client is closed");
         }
-        ensureNodesAreAvailable(nodes);
+        doRetryWithExponentialBackoff(
+              () -> {
+                  ensureNodesAreAvailable(nodes);
+              },
+              (e) -> {
+                  throw e;
+              });
+
         int index = getNodeNumber();
         RetryListener<Response> retryListener = new RetryListener<>(callback, listener, nodes, index, hostFailureListener);
         DiscoveryNode node = retryListener.getNode(0);
@@ -258,6 +266,43 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         }
     }
 
+    public static boolean isTextIQRetryExceptionClass(Exception e) {
+        return e instanceof NoNodeAvailableException
+               || e instanceof NodeDisconnectedException
+               || e instanceof NodeNotConnectedException
+               || e instanceof NoShardAvailableActionException;
+    }
+
+    public void doRetryWithExponentialBackoff(BasicCallback mainAttempt, ExceptionHandlingCallback onFailure) {
+        int failure = 0;
+        int maxFailure = 6;
+        while (true) {
+            try {
+                mainAttempt.execute();
+                return;
+            } catch (RuntimeException mainException) {
+                if (!isTextIQRetryExceptionClass(mainException)) {
+                    onFailure.execute(mainException);
+                    return;
+                }
+                try {
+                    failure += 1;
+                    if (failure <= maxFailure) {
+                        mainException.printStackTrace();
+                        System.err.println("Delayed due to above Exception");
+                        Thread.sleep(((int) Math.pow(2, failure)) * 1000);
+                    } else {
+                        onFailure.execute(mainException);
+                        return;
+                    }
+                } catch (InterruptedException interruptedException) {
+                    throw new RuntimeException(interruptedException);
+                }
+            }
+        }
+    }
+
+
     public static class RetryListener<Response> implements ActionListener<Response> {
         private final NodeListenerCallback<Response> callback;
         private final ActionListener<Response> listener;
@@ -266,6 +311,8 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         private final TransportClient.HostFailureListener hostFailureListener;
 
         private volatile int i;
+        private AtomicInteger retries;
+        private static final int MAX_FAILURE_RETRIES = 6;
 
         RetryListener(NodeListenerCallback<Response> callback, ActionListener<Response> listener,
                              List<DiscoveryNode> nodes, int index, TransportClient.HostFailureListener hostFailureListener) {
@@ -274,6 +321,7 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
             this.nodes = nodes;
             this.index = index;
             this.hostFailureListener = hostFailureListener;
+            this.retries = new AtomicInteger(0);
         }
 
         @Override
@@ -284,26 +332,46 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
         @Override
         public void onFailure(Exception e) {
             Throwable throwable = ExceptionsHelper.unwrapCause(e);
-            if (throwable instanceof ConnectTransportException) {
-                maybeNodeFailed(getNode(this.i), (ConnectTransportException) throwable);
-                int i = ++this.i;
-                if (i >= nodes.size()) {
-                    listener.onFailure(new NoNodeAvailableException("None of the configured nodes were available: " + nodes, e));
-                } else {
+            int currentRetryNum = retries.incrementAndGet();
+
+            if (isTextIQRetryExceptionClass(e) && currentRetryNum <= MAX_FAILURE_RETRIES) {
+                try {
+                    e.printStackTrace();
+                    System.err.println("Delayed due to above Exception");
+                    Thread.sleep(((int) Math.pow(2, currentRetryNum)) * 1000);
                     try {
                         callback.doWithNode(getNode(i), this);
-                    } catch(final Exception inner) {
-                        inner.addSuppressed(e);
-                        // this exception can't come from the TransportService as it doesn't throw exceptions at all
-                        listener.onFailure(inner);
+                    } catch (final Exception inner) {
+                        onFailure(inner);
                     }
+                } catch (InterruptedException interruptedException) {
+                    throw new RuntimeException(interruptedException);
                 }
             } else {
-                listener.onFailure(e);
+                if (throwable instanceof ConnectTransportException) {
+                    maybeNodeFailed(getNode(this.i), (ConnectTransportException) throwable);
+                    int i = ++this.i;
+                    if (i >= nodes.size()) {
+                        listener.onFailure(new NoNodeAvailableException("None of the configured nodes were available: " + nodes, e));
+                    } else {
+                        try {
+                            callback.doWithNode(getNode(i), this);
+                        } catch(final Exception inner) {
+                            inner.addSuppressed(e);
+                            // this exception can't come from the TransportService as it doesn't throw exceptions at all
+                            listener.onFailure(inner);
+                        }
+                    }
+                } else {
+                    listener.onFailure(e);
+                }
             }
         }
 
         final DiscoveryNode getNode(int i) {
+            if (nodes.size() == 0) {
+                throw new NoNodeAvailableException("No Node in TransportClientNodeService");
+            }
             return nodes.get((index + i) % nodes.size());
         }
 
@@ -576,5 +644,13 @@ final class TransportClientNodesService extends AbstractComponent implements Clo
     // pkg private for testing
     void doSample() {
         nodesSampler.doSample();
+    }
+
+    public interface BasicCallback {
+        void execute();
+    }
+
+    public interface ExceptionHandlingCallback {
+        void execute(RuntimeException e);
     }
 }
